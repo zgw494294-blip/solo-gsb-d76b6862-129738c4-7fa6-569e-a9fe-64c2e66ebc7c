@@ -72,7 +72,7 @@ python app.py
 - 手动 `POST /terminate` 会**取消脚本**（停止后续动作）并 SIGKILL 终止进程，结果记为「已取消」；
 - 发送阻塞（如超过管道容量的长行等待子进程读取）同样受**总时限**与**终止**控制；
 - **成功**：全部步骤完成且进程退出码为 0；
-- **失败**：总时限超时、写入失败（含孤立代理等无法 UTF-8 编码的行）、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步）与原因，并终止尚存进程；
+- **失败**：总时限超时、写入失败（含孤立代理等无法 UTF-8 编码的行，以及发送等待异常——如服务打开文件过多使 stdin 描述符超出 `select` 的 1024 上限）、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步，下标从 0 开始）与原因，并终止尚存进程；
 - 结果与重跑都等到**输出排空、进程回收、脚本停止**之后：结果通过 `/events` 中 `stream: "auto"` 的事件公布（`phase: "step"` 为步骤进展，`phase: "result"` 为最终结果），此前槽位不释放；旧脚本只持有旧运行对象，操作不到新运行。
 
 ### 可执行样例
@@ -237,6 +237,102 @@ curl -s "localhost:8000/events?run_id=$RUN&after=0"
    ```
 
    旧运行的脚本线程已随结果公布停止，只持有旧运行对象，影响不到新运行。
+
+## 高描述符发送等待异常复现与重跑（回归验证）
+
+自动对话发送**超过管道容量的合法长行**、管道已满而子进程暂不读取时，发送线程会在 `select` 上等待管道可写。Linux 的 `select` 只支持文件描述符小于 `FD_SETSIZE`（1024）的句柄：当服务已经打开大量文件（描述符排到 1024 及以上），子进程 stdin 的描述符超出该范围后，管道满时等待会抛 `ValueError: filedescriptor out of range in select()`。
+
+修复前该异常逃出脚本线程：驱动直接退出、**不公布任何结果、不终止进程**，于是单运行槽位被永久占用——超过总时限或手动「终止」都无法重跑。修复后发送等待异常按统一失败收尾：记录当前步骤下标（从 0 开始）与原因、停止后续步骤、终止尚存进程；两路输出排空、进程回收、脚本收尾完成后才公布**唯一**失败结果并释放槽位。取消仍然优先；进程即使恰在此前正常退出（退出码 0）也不得改判成功。不缩短长行、不提前拒绝合法输入、不直接清除 busy。
+
+### 复现前提：让服务持有大量文件描述符
+
+不改动 `docker compose up --build` 的单命令启动方式；下面的本地启动方式仅用于复现（先把进程软限制抬高到硬限制，再占住约 1024 个低位描述符，之后子进程管道描述符必然 ≥ 1024）：
+
+```bash
+python3 - <<'PY'
+import os, resource, sys
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
+# 占住低位描述符，使后续子进程 stdin/stdout/stderr 管道 fd >= 1024
+_fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(1024)]
+sys.argv = ["app.py"]
+exec(open("app.py", encoding="utf-8").read(), {"__name__": "__main__"})
+PY
+```
+
+> 若环境的硬限制本身低于 1030（如部分容器 `ulimit -Hn` 为 1024），请先在宿主机放开（如 `ulimit -Hn 65536` 后再启动；容器可在 `docker run` 上加 `--ulimit nofile=65536:65536`）。Docker Compose 的默认启动、网页地址与端口均不变（仍为 <http://localhost:8000>）。
+
+### 1. 提交会触发发送等待的自动对话
+
+程序先输出 `READY`，然后**暂不读取 stdin**（长时间睡眠）；步骤等待 `READY`、发送一条 200 KiB 的合法长行写满管道、再等待永远不会出现的 `DONE`。长行较长（超过单条命令行参数约 128 KiB 的上限），先用脚本生成请求体文件，再让 curl 从文件读取（长行不缩短、不提前拒绝）：
+
+```bash
+python3 - <<'PY'
+import json
+payload = {
+    "code": "import sys,time\nprint(\"READY\", flush=True)\ntime.sleep(300)\n",
+    "steps": [
+        {"action": "wait", "stream": "stdout", "text": "READY"},
+        {"action": "send", "line": "x" * 200000},
+        {"action": "wait", "stream": "stdout", "text": "DONE"},
+    ],
+    "timeout": 60,
+}
+with open("payload.json", "w", encoding="utf-8") as f:
+    json.dump(payload, f)
+PY
+
+RUN=$(curl -s localhost:8000/auto -H 'Content-Type: application/json' \
+  -d @payload.json | python3 -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
+echo "$RUN"
+```
+
+### 2. 轮询事件，看到唯一失败结果（修复前永远等不到 result）
+
+```bash
+curl -s "localhost:8000/events?run_id=$RUN&after=0"
+```
+
+预期行为：
+
+- 步骤进展停在第 2 步（`index: 1`，下标从 0 开始），后续「等待 `DONE`」不再执行；
+- 子进程被 SIGKILL 终止；stdout/stderr 排空、进程回收（`meta` 退出事件在先）之后，才公布**一次**失败结果，长行本身不被截断或拒绝：
+
+  ```json
+  {"phase": "result", "state": "failed", "index": 1, "total": 3,
+   "reason": "写入失败：发送等待时 select 失败（stdin 描述符 1028 超出 select 支持范围）：filedescriptor out of range in select()",
+   "exit_code": -9}
+  ```
+
+  （描述符编号随环境变化，含义一致。）
+- 即使在修复后的收尾之前进程恰自行正常退出（退出码 0），结果仍为失败，不改判成功。
+
+### 3. 超过时限或手动终止不再占槽，随后可立即重跑
+
+修复前，即便等到 `timeout` 耗尽或对旧 `run_id` 调用终止，`/status` 的 `busy` 始终为 `true`，再次提交一直返回 409。修复后失败公布即释放槽位：
+
+```bash
+# 复现期间也可以先手动终止，结果同样会按「已取消」收尾并释放槽位：
+# curl -s localhost:8000/terminate -H 'Content-Type: application/json' \
+#   -d "{\"run_id\": \"$RUN\"}"
+
+curl -s localhost:8000/status        # busy 为 false
+
+# 换成程序会读输入的正常交互重跑：返回新 run_id，最终成功
+RUN2=$(curl -s localhost:8000/auto -H 'Content-Type: application/json' -d '{
+  "code": "import sys\nprint(\"READY\", flush=True)\nprint(\"GOT \" + sys.stdin.readline().strip(), flush=True)",
+  "steps": [
+    {"action": "wait", "stream": "stdout", "text": "READY"},
+    {"action": "send", "line": "hello"},
+    {"action": "wait", "stream": "stdout", "text": "GOT hello"}
+  ],
+  "timeout": 30
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
+curl -s "localhost:8000/events?run_id=$RUN2&after=0"
+# 预期结果事件：{"phase": "result", "state": "success", "index": null, "total": 3, "exit_code": 0}
+```
+
+旧运行的脚本线程已随结果公布停止，只持有旧运行对象，操作不到新运行；旧 `run_id` 对新进程仍返回 409。
 
 ## 接口
 
