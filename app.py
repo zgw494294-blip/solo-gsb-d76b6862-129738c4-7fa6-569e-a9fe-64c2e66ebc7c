@@ -12,11 +12,14 @@
   run_id。等待跨事件片段匹配，每路从上次匹配末尾继续，已到达与后续
   内容都参与匹配；脚本只读取、不消费页面事件流。自动运行占用同一单
   运行槽位：期间手动输入与 EOF 返回 409，手动终止取消脚本、停止后续
-  动作；发送阻塞同样受总时限与终止控制。全部步骤完成且退出码为 0 才
-  成功；超时、写入失败（含孤立代理等无法 UTF-8 编码的行）、非零退出
-  或排空后仍有未完成步骤时失败，注明失败位置与原因并终止尚存进程。
-  结果公布与重跑都等到输出排空、进程
-  回收、脚本停止之后；旧脚本只持有旧运行对象，操作不到新运行。
+  动作；发送阻塞同样受总时限与终止控制。发送等待中的任何异常（如
+  select 系调用在高描述符下抛 ValueError）都不会使脚本裸退：记录当前
+  从 0 开始的步骤 index 与 reason，停止后续步骤、终止尚存进程。
+  全部步骤完成且退出码为 0 才成功；超时、写入失败（含孤立代理等无法
+  UTF-8 编码的行、发送等待异常）、非零退出或排空后仍有未完成步骤时
+  失败，注明失败位置与原因并终止尚存进程。结果公布与重跑都等到两路
+  输出排空、进程回收、脚本停止之后；取消优先于失败，进程正常退出
+  不得覆盖失败；旧脚本只持有旧运行对象，操作不到新运行。
 - 全站同时仅一个未结束运行；旧 run_id 对新进程一律无效。
 - 正常退出与主动终止（SIGKILL，不等程序自行退出）都会先排空两路输出、
   回收进程，之后才公布退出码并允许重跑。
@@ -25,7 +28,7 @@
 
 import codecs
 import os
-import select
+import selectors
 import shutil
 import subprocess
 import sys
@@ -183,11 +186,14 @@ class Run:
     def write_line_auto(self, line, deadline, cancel_event):
         """自动对话专用写：与 write_line 同约定，但阻塞受总时限与取消控制。
 
-        把管道切为非阻塞后循环写：管道满时在 select 上短暂等待，每轮
+        把管道切为非阻塞后循环写：管道满时在可写事件上短暂等待，每轮
         都检查取消事件与总时限，因此手动终止或超时都能及时打断发送；
-        整行连同末尾换行仍然完整送达，不截断。含孤立代理等无法
-        UTF-8 编码的字符时不抛异常，按发送失败返回错误信息——
-        由脚本线程把当前步骤标记为失败并走统一收尾。
+        整行连同末尾换行仍然完整送达，不截断。等待使用 selectors
+        （Linux 下为 epoll）而非 select.select：服务打开大量文件后，
+        子进程 stdin 的 fd 可能超过 select 的 fd_set 上限（1023），
+        select.select 会直接抛 ValueError，epoll 无此限制。
+        含孤立代理等无法 UTF-8 编码的字符时不抛异常，按发送失败返回
+        错误信息——由脚本线程把当前步骤标记为失败并走统一收尾。
         """
         try:
             payload = (line + "\n").encode("utf-8")
@@ -214,11 +220,17 @@ class Run:
                     n = os.write(fd, view)
                     view = view[n:]
                 except BlockingIOError:
-                    # 管道已满：等子进程读出一些再写，同时轮询取消与时限
+                    # 管道已满：等子进程读出一些再写，同时轮询取消与时限。
+                    # 用 selectors（epoll/poll/kqueue）等待可写，避免
+                    # select.select 的 fd_set 上限在高描述符下抛 ValueError。
                     try:
-                        select.select([], [fd], [], min(remaining, 0.2))
-                    except OSError:
+                        with selectors.DefaultSelector() as sel:
+                            sel.register(fd, selectors.EVENT_WRITE)
+                            sel.select(timeout=min(remaining, 0.2))
+                    except (OSError, ValueError):
                         return "子进程已关闭标准输入"
+                    # 唤醒后（无论就绪、超时还是错误/挂断）都回到循环顶部：
+                    # 重新检查取消与时限，再由 os.write 决定成功还是失败。
                 except OSError:
                     return "子进程已关闭标准输入"
         return None
@@ -342,46 +354,56 @@ class AutoScript:
         failure = None              # (步骤下标或 None, 原因)
         cancelled = False
         at = None                   # 取消时所在步骤（None 表示退出等待阶段）
-        for i, step in enumerate(self.steps):
-            at = i
-            action = step["action"]
-            err = None
-            if action == "wait":
-                err = self._wait_text(i, step["stream"], step["text"])
-            elif action == "send":
-                line = step["line"]
-                self._progress(i, "发送单行「%s」" % self._shown(line))
-                if self.cancel_event.is_set():
-                    err = "已取消"
-                else:
-                    err = run.write_line_auto(line, self.deadline,
-                                              self.cancel_event)
-                    if err is not None and err != "已取消":
-                        err = "写入失败：" + err
-            else:                   # action == "close"
-                self._progress(i, "关闭标准输入（EOF）")
-                if self.cancel_event.is_set():
-                    err = "已取消"
-                else:
-                    run.close_stdin()
-            if err is not None:
-                # 取消优先于失败：终止与超时/写入失败同时发生时记为取消
-                if self.cancel_event.is_set():
-                    cancelled = True
-                else:
-                    failure = (i, err)
-                break
-        if not cancelled and failure is None:
-            at = None
-            self._progress(None, "全部步骤完成，等待进程退出")
-            err = self._await_exit()
-            if err is not None:
-                if self.cancel_event.is_set():
-                    cancelled = True
-                else:
-                    failure = (None, err)
+        try:
+            for i, step in enumerate(self.steps):
+                at = i
+                action = step["action"]
+                err = None
+                if action == "wait":
+                    err = self._wait_text(i, step["stream"], step["text"])
+                elif action == "send":
+                    line = step["line"]
+                    self._progress(i, "发送单行「%s」" % self._shown(line))
+                    if self.cancel_event.is_set():
+                        err = "已取消"
+                    else:
+                        err = run.write_line_auto(line, self.deadline,
+                                                  self.cancel_event)
+                        if err is not None and err != "已取消":
+                            err = "写入失败：" + err
+                else:                   # action == "close"
+                    self._progress(i, "关闭标准输入（EOF）")
+                    if self.cancel_event.is_set():
+                        err = "已取消"
+                    else:
+                        run.close_stdin()
+                if err is not None:
+                    # 取消优先于失败：终止与超时/写入失败同时发生时记为取消
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                    else:
+                        failure = (i, err)
+                    break
+            if not cancelled and failure is None:
+                at = None
+                self._progress(None, "全部步骤完成，等待进程退出")
+                err = self._await_exit()
+                if err is not None:
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                    else:
+                        failure = (None, err)
+        except Exception as exc:
+            # 发送等待等阶段的任何意外异常都不得让脚本裸退（否则结果永不
+            # 公布、槽位永久占用）：记录当前从 0 开始的 index 与 reason，
+            # 作为本步骤失败走统一收尾。取消仍然优先。
+            if self.cancel_event.is_set():
+                cancelled = True
+            else:
+                failure = (at, "发送等待异常：%s: %s"
+                           % (type(exc).__name__, exc))
         if cancelled or failure is not None:
-            # 终止尚存进程（已退出的忽略），并等输出排空、进程回收
+            # 终止尚存进程（已退出的忽略），并等两路输出排空、进程回收
             try:
                 run.proc.kill()
             except OSError:

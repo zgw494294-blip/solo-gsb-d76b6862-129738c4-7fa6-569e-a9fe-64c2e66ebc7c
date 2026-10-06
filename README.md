@@ -72,7 +72,7 @@ python app.py
 - 手动 `POST /terminate` 会**取消脚本**（停止后续动作）并 SIGKILL 终止进程，结果记为「已取消」；
 - 发送阻塞（如超过管道容量的长行等待子进程读取）同样受**总时限**与**终止**控制；
 - **成功**：全部步骤完成且进程退出码为 0；
-- **失败**：总时限超时、写入失败（含孤立代理等无法 UTF-8 编码的行）、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步）与原因，并终止尚存进程；
+- **失败**：总时限超时、写入失败（含孤立代理等无法 UTF-8 编码的行）、发送等待异常（如高描述符下 `select` 抛 `ValueError`）、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步）与原因，并终止尚存进程；
 - 结果与重跑都等到**输出排空、进程回收、脚本停止**之后：结果通过 `/events` 中 `stream: "auto"` 的事件公布（`phase: "step"` 为步骤进展，`phase: "result"` 为最终结果），此前槽位不释放；旧脚本只持有旧运行对象，操作不到新运行。
 
 ### 可执行样例
@@ -237,6 +237,114 @@ curl -s "localhost:8000/events?run_id=$RUN&after=0"
    ```
 
    旧运行的脚本线程已随结果公布停止，只持有旧运行对象，影响不到新运行。
+
+## 高描述符复现与重跑（回归验证）
+
+服务进程已打开大量文件时，子进程 stdin 写端的描述符可能超过 `select()` 的 `fd_set` 上限（1023）。修复前，自动对话在**发送等待阶段**（管道满、等子进程读入）调用 `select.select` 会直接抛 `ValueError: filedescriptor out of range in select()`，该异常不在原有捕获范围内，脚本线程因此裸退：结果永不公布、子进程与单运行槽位无人回收，超过总时限或手动「终止」后槽位仍永久占用（`busy: true`），再也无法重跑。
+
+修复后等待原语改用 `selectors`（Linux 下为 epoll，无描述符上限）：合法长行照常完整送达；即便发送等待中出现其他意外异常，也按统一失败收尾——记录当前从 0 开始的 `index` 与 `reason`，停止后续步骤、终止尚存进程，两路输出排空、进程回收及脚本收尾完成后才公布唯一失败结果并释放槽位（取消仍然优先，进程正常退出不得覆盖失败）。
+
+### 1. 用高描述符启动服务
+
+容器内描述符由 Docker 管理，本节按上文「不使用 Docker」的方式本地启动（原 `docker compose up --build` 单命令、<http://localhost:8000> 与端口 `8000` 均不变）。先放开文件描述符上限，再让服务在启动前持有 1100 个已打开的描述符：
+
+```bash
+pip install -r requirements.txt
+ulimit -n 4096
+python3 -c "
+import os, runpy
+held = [os.open('/dev/null', os.O_RDONLY) for _ in range(1100)]
+runpy.run_path('app.py', run_name='__main__')
+"
+```
+
+服务仍监听 <http://localhost:8000>。此时启动的每个子进程，其 stdin 写端描述符都在 1023 以上。
+
+### 2. 高描述符下发送合法长行（成功）
+
+程序打印 `READY` 后等约 1 秒再读输入；自动脚本先等到 `READY`，再发送一条 200 KiB 的合法单行（超过 64 KiB 管道容量，发送时必然进入“管道满等待”）：
+
+```bash
+RUN=$(python3 - <<'PY'
+import json, urllib.request
+code = ("import sys,time\nprint('READY', flush=True)\ntime.sleep(1.0)\n"
+        "line = sys.stdin.readline()\nprint('GOT %d' % len(line.rstrip(chr(10))), flush=True)\n")
+payload = {"code": code, "timeout": 30, "steps": [
+    {"action": "wait", "stream": "stdout", "text": "READY"},
+    {"action": "send", "line": "x" * 200000},
+    {"action": "wait", "stream": "stdout", "text": "GOT 200000"},
+]}
+req = urllib.request.Request("http://localhost:8000/auto",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"})
+print(json.load(urllib.request.urlopen(req))["run_id"])
+PY
+)
+
+curl -s "localhost:8000/events?run_id=$RUN&after=0"
+```
+
+- 修复前：脚本线程在发送等待时因 `ValueError` 裸退，`stream=auto` 始终没有 `phase=result` 事件，`GET /status` 一直 `busy: true`；等过总时限（30 秒）或 `POST /terminate` 后依旧占用，重跑 `POST /auto` 永远返回 409。
+- 修复后：epoll 等待不受描述符上限影响，整行连同末尾换行完整送达，最终公布：
+
+  ```json
+  {"phase": "result", "state": "success", "index": null, "total": 3, "exit_code": 0}
+  ```
+
+  stdout 中可见 `GOT 200000`，不截断、不限长、不提前拒绝合法输入。
+
+### 3. 高描述符下程序不读输入（失败 + 重跑）
+
+把程序换成打印 `READY` 后长期不读输入，长行会一直压在管道上直到总时限：
+
+```bash
+RUN=$(python3 - <<'PY'
+import json, urllib.request
+code = "import sys,time\nprint('READY', flush=True)\ntime.sleep(300)\n"
+payload = {"code": code, "timeout": 5, "steps": [
+    {"action": "wait", "stream": "stdout", "text": "READY"},
+    {"action": "send", "line": "x" * 200000},
+    {"action": "wait", "stream": "stdout", "text": "NEVER"},
+]}
+req = urllib.request.Request("http://localhost:8000/auto",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"})
+print(json.load(urllib.request.urlopen(req))["run_id"])
+PY
+)
+
+curl -s "localhost:8000/events?run_id=$RUN&after=0"
+```
+
+修复后的预期：后续「等待 `NEVER`」不再执行；进程被 SIGKILL，`meta` 退出事件（`exit_code: -9`）在先、失败结果在后，且只有一次：
+
+```json
+{"phase": "result", "state": "failed", "index": 1, "total": 3,
+ "reason": "写入失败：超过总时限", "exit_code": -9}
+```
+
+随后槽位立即释放，可直接重跑（旧脚本只持有旧运行对象，影响不到新运行）：
+
+```bash
+curl -s localhost:8000/status        # busy 为 false
+
+# 换成程序会读输入的正常运行：返回新 run_id，最终 success、exit_code 0
+python3 - <<'PY'
+import json, time, urllib.request
+code = ("import sys\nprint('READY', flush=True)\n"
+        "line = sys.stdin.readline()\nprint('GOT ' + line.strip(), flush=True)\n")
+payload = {"code": code, "timeout": 30, "steps": [
+    {"action": "wait", "stream": "stdout", "text": "READY"},
+    {"action": "send", "line": "hello"},
+    {"action": "wait", "stream": "stdout", "text": "GOT hello"},
+]}
+req = urllib.request.Request("http://localhost:8000/auto",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"})
+rid = json.load(urllib.request.urlopen(req))["run_id"]
+print("new run:", rid)
+PY
+```
 
 ## 接口
 
